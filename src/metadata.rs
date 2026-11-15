@@ -41,6 +41,8 @@ pub(crate) struct Metadata {
     pub(crate) resolve: Resolve,
     /// The absolute path to the root of the workspace.
     pub(crate) workspace_root: PathBuf,
+    /// The absolute path to the directory where all build artifacts are placed.
+    pub(crate) target_directory: PathBuf,
 }
 
 impl Metadata {
@@ -167,12 +169,20 @@ impl Metadata {
             Some(resolve) => Resolve::from_obj(resolve, &pkg_id_map, cargo_version)?,
             None => Resolve { nodes: HashMap::default() },
         };
+        let workspace_root: PathBuf = map.remove_string("workspace_root")?;
+        // target_directory has been present in cargo metadata for a long time,
+        // but fall back to the default just in case.
+        let target_directory = match map.remove_string::<PathBuf>("target_directory") {
+            Ok(target_directory) => target_directory,
+            Err(_) => workspace_root.join("target"),
+        };
         Ok(Self {
             cargo_version,
             packages: packages.into_boxed_slice(),
             workspace_members,
             resolve,
-            workspace_root: map.remove_string("workspace_root")?,
+            workspace_root,
+            target_directory,
         })
     }
 }

@@ -4,10 +4,11 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fmt,
+    io::{self, Read, Write},
     path::Path,
-    process::{Command, ExitStatus, Output},
+    process::{Command, ExitStatus, Output, Stdio},
     rc::Rc,
-    str,
+    str, thread,
 };
 
 use anyhow::{Context as _, Error, Result};
@@ -129,6 +130,39 @@ impl<'a> ProcessBuilder<'a> {
         let status = self.build().status().with_context(|| {
             process_error(format!("could not execute process {self:#}"), None, None)
         })?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(process_error(
+                format!("process didn't exit successfully: {self:#}"),
+                Some(status),
+                None,
+            ))
+        }
+    }
+
+    /// Executes a process like [`run`](Self::run), but forwards its output to
+    /// stdout/stderr as it is produced instead of inheriting them, and passes
+    /// the captured output to `on_output` before checking the exit status.
+    pub(crate) fn run_tee(&self, mut on_output: impl FnMut(&[u8])) -> Result<()> {
+        let mut child =
+            self.build().stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().with_context(
+                || process_error(format!("could not execute process {self:#}"), None, None),
+            )?;
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let stdout_thread = thread::spawn(move || tee(stdout, io::stdout()));
+        let stderr_thread = thread::spawn(move || tee(stderr, io::stderr()));
+        let status = child.wait().with_context(|| {
+            process_error(format!("could not execute process {self:#}"), None, None)
+        })?;
+        let output = stdout_thread
+            .join()
+            .unwrap_or_default()
+            .into_iter()
+            .chain(stderr_thread.join().unwrap_or_default())
+            .collect::<Vec<_>>();
+        on_output(&output);
         if status.success() {
             Ok(())
         } else {
@@ -270,4 +304,30 @@ fn process_error(mut msg: String, status: Option<ExitStatus>, output: Option<&Ou
     }
 
     Error::msg(msg)
+}
+
+/// Reads from `pipe`, forwarding everything to `out` as it is produced, and
+/// returns everything that was read.
+///
+/// Errors from `out` (e.g., broken pipe) are ignored, as the output has
+/// already been captured at that point.
+fn tee(mut pipe: impl Read, mut out: impl Write) -> Vec<u8> {
+    let mut buf = [0; 1024 * 8];
+    let mut captured = Vec::new();
+    loop {
+        match pipe.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                captured.extend_from_slice(&buf[..n]);
+                let _ = out.write_all(&buf[..n]);
+                let _ = out.flush();
+            }
+            // Retry interrupted reads; on other errors, stop reading. Dropping
+            // `pipe` closes it, so the child cannot block forever on a full
+            // pipe while we wait for it to exit.
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    captured
 }

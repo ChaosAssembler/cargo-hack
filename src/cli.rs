@@ -57,6 +57,8 @@ pub(crate) struct Args {
     pub(crate) partition: Option<Partition>,
     /// --print-command-list
     pub(crate) print_command_list: bool,
+    /// --prioritize
+    pub(crate) prioritize: bool,
     /// --version-range/--rust-version
     pub(crate) version_range: Option<VersionRange>,
     /// --version-step
@@ -176,6 +178,7 @@ impl Args {
         let mut keep_going = false;
         let mut partition = None;
         let mut print_command_list = false;
+        let mut prioritize = false;
         let mut no_manifest_path = false;
         let mut locked = false;
         let mut rust_version = false;
@@ -354,6 +357,7 @@ impl Args {
                 Long("keep-going") => parse_flag!(keep_going),
                 Long("partition") => parse_opt!(partition, false),
                 Long("print-command-list") => parse_flag!(print_command_list),
+                Long("prioritize") => parse_flag!(prioritize),
                 Long("no-manifest-path") => parse_flag!(no_manifest_path),
                 Long("locked") => {
                     let flag = format_flag(&arg);
@@ -545,6 +549,9 @@ impl Args {
         if no_dev_deps && remove_dev_deps {
             conflicts("--no-dev-deps", "--remove-dev-deps")?;
         }
+        if prioritize && partition.is_some() {
+            conflicts("--prioritize", "--partition")?;
+        }
         if each_feature && feature_powerset {
             conflicts("--each-feature", "--feature-powerset")?;
         }
@@ -687,6 +694,7 @@ impl Args {
             keep_going,
             partition,
             print_command_list,
+            prioritize,
             no_manifest_path,
             include_features: include_features.into_iter().map(Into::into).collect(),
             at_least_one_of,
@@ -905,6 +913,17 @@ const HELP: &[HelpText<'_>] = &[
     ]),
     ("", "--keep-going", "", "Keep going on failure", &[]),
     ("", "--partition", "<M/N>", "Partition runs and execute only its subset according to M/N", &[
+    ]),
+    ("", "--prioritize", "", "Prioritize commands whose diagnostics changed in previous runs", &[
+        "When this flag is used, the diagnostics of each cargo command are recorded in a cache file in \
+         the target directory, and in subsequent runs commands are executed in order of how \
+         recently their diagnostics changed (the most recently changed first).",
+        "This does not skip any commands; it only changes the order in which they are executed.",
+        "This option is intended for commands whose diagnostics matter (e.g., check and clippy); while the output is recorded, cargo's colors and progress indicators are disabled.",
+        "The cache file is stored in the target directory reported by cargo metadata (it does not follow --target-dir passed to cargo) and is removed by cargo clean.",
+        "If runs are repeatedly cancelled before completion (e.g., by rust-analyzer on the next edit), commands whose diagnostics changed may not be discovered until a run completes; commands that have never been run are executed first.",
+        "This option has no effect with --workspace-behavior=cargo.",
+        "This flag may not be used together with --partition.",
     ]),
     ("", "--log-group", "<KIND>", "Log grouping: none, github-actions", &[
         "If this option is not used, the environment will be automatically detected.",

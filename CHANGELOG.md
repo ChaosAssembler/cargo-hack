@@ -12,6 +12,16 @@ Note: In this file, do not use the hard wrap in the middle of a sentence for com
 
 ## [Unreleased]
 
+- Add `--prioritize` option.
+
+  When this option is used, the diagnostics of each cargo command are recorded in a cache file in the target directory, and in subsequent runs commands are executed in order of how recently their diagnostics changed (the most recently changed first). This does not skip any commands; it only changes the order in which they are executed.
+
+  This option is intended for commands whose diagnostics matter (e.g., `check` and `clippy`); while the output is recorded, cargo's colors and progress indicators are disabled. This option has no effect with `--workspace-behavior=cargo`.
+
+  The cache file is stored in the target directory reported by cargo metadata (it does not follow `--target-dir` passed to cargo) and is removed by `cargo clean`. If runs are repeatedly cancelled before completion (e.g., by rust-analyzer on the next edit), commands whose diagnostics changed may not be discovered until a run completes; commands that have never been run are executed first.
+
+  This option may not be used together with `--partition`.
+
 ## [0.6.46] - 2026-11-01
 
 - Support `-m` alias [added in Cargo 1.97](https://github.com/rust-lang/cargo/pull/16858).

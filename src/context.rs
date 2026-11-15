@@ -2,6 +2,7 @@
 
 use std::{
     borrow::Cow,
+    cell::RefCell,
     collections::HashMap,
     env,
     ffi::OsString,
@@ -17,7 +18,7 @@ use crate::{
     features::Features,
     manifest::Manifest,
     metadata::{Metadata, Package, PackageId},
-    restore, term,
+    prioritize, restore, term,
 };
 
 pub(crate) struct Context {
@@ -30,6 +31,9 @@ pub(crate) struct Context {
     pub(crate) restore: restore::Manager,
     pub(crate) current_dir: PathBuf,
     pub(crate) current_package: Option<PackageId>,
+    /// Cache used by `--prioritize` to reorder commands based on the
+    /// diagnostics of previous runs.
+    pub(crate) prioritize_cache: Option<RefCell<prioritize::Cache>>,
 }
 
 impl Context {
@@ -90,6 +94,13 @@ impl Context {
             }
         }
 
+        let prioritize_cache = args.prioritize.then(|| {
+            RefCell::new(prioritize::Cache::load(
+                &metadata.target_directory,
+                &metadata.workspace_root,
+            ))
+        });
+
         let this = Self {
             args,
             metadata,
@@ -100,6 +111,7 @@ impl Context {
             restore,
             current_dir: env::current_dir()?,
             current_package,
+            prioritize_cache,
         };
 
         // TODO: Ideally, we should do this, but for now, we allow it as cargo-hack

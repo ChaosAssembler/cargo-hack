@@ -15,11 +15,13 @@ mod features;
 mod fs;
 mod manifest;
 mod metadata;
+mod prioritize;
 mod restore;
 mod rustup;
 mod version;
 
 use std::{
+    cmp::Reverse,
     collections::{BTreeMap, HashSet},
     env,
     ffi::OsString,
@@ -59,7 +61,7 @@ fn try_main() -> Result<()> {
     let Some(args) = cli::Args::parse(&cargo)? else { return Ok(()) };
     let cx = &Context::new(args, cargo)?;
 
-    manifest::with(cx, || {
+    let res = manifest::with(cx, || {
         if cx.subcommand.is_none() {
             return Ok(());
         }
@@ -193,7 +195,17 @@ fn try_main() -> Result<()> {
             error!("{keep_going}");
         }
         Ok(())
-    })
+    });
+
+    // Save the cache even if some commands failed, so that the results of the
+    // commands that did run are not lost. Do not save it when commands were
+    // not actually run (--print-command-list or no subcommand).
+    if cx.subcommand.is_some() && !cx.print_command_list {
+        if let Some(cache) = &cx.prioritize_cache {
+            cache.borrow_mut().save();
+        }
+    }
+    res
 }
 
 #[derive(Default)]
@@ -502,9 +514,9 @@ fn exec_on_packages(
             line.arg(target);
         }
         match cx.workspace_behavior {
-            WorkspaceBehavior::Default => packages.iter().try_for_each(|pkg| {
-                exec_on_package(cx, pkg.id, &pkg.kind, &line, progress, keep_going)
-            }),
+            WorkspaceBehavior::Default => {
+                exec_on_packages_default(cx, packages, &line, progress, keep_going)
+            }
             WorkspaceBehavior::Cargo => exec_cargo(cx, None, &line, progress, keep_going),
         }
     } else {
@@ -513,23 +525,23 @@ fn exec_on_packages(
             line.arg("--target");
             line.arg(target);
             match cx.workspace_behavior {
-                WorkspaceBehavior::Default => packages.iter().try_for_each(|pkg| {
-                    exec_on_package(cx, pkg.id, &pkg.kind, &line, progress, keep_going)
-                }),
+                WorkspaceBehavior::Default => {
+                    exec_on_packages_default(cx, packages, &line, progress, keep_going)
+                }
                 WorkspaceBehavior::Cargo => exec_cargo(cx, None, &line, progress, keep_going),
             }
         })
     }
 }
 
-fn exec_on_package(
+/// Builds the list of cargo commands to run for a package, in the default
+/// order.
+fn package_commands<'a>(
     cx: &Context,
     id: PackageId,
     kind: &Kind<'_>,
-    line: &ProcessBuilder<'_>,
-    progress: &mut Progress,
-    keep_going: &mut KeepGoing,
-) -> Result<()> {
+    line: &ProcessBuilder<'a>,
+) -> Vec<ProcessBuilder<'a>> {
     let package = cx.packages(id);
 
     let mut line = line.clone();
@@ -542,10 +554,12 @@ fn exec_on_package(
         );
     }
 
+    let mut commands = vec![];
     match kind {
         Kind::Normal => {
             // only run with default features
-            return exec_cargo(cx, Some(id), &line, progress, keep_going);
+            commands.push(line);
+            return commands;
         }
         Kind::Each { .. } | Kind::Powerset { .. } => {}
     }
@@ -571,11 +585,11 @@ fn exec_on_package(
             Kind::Normal => unreachable!(),
         };
     if !exclude_all_features {
-        let mut line = line.clone();
+        let mut all_features = line.clone();
         // run with all features
         // https://github.com/taiki-e/cargo-hack/issues/42
-        line.arg("--all-features");
-        exec_cargo(cx, Some(id), &line, progress, keep_going)?;
+        all_features.arg("--all-features");
+        commands.push(all_features);
     }
 
     if !cx.no_default_features {
@@ -589,13 +603,15 @@ fn exec_on_package(
 
     if !cx.exclude_no_default_features {
         // run with no default features if the package has other features
-        exec_cargo(cx, Some(id), &line, progress, keep_going)?;
+        commands.push(line.clone());
     }
 
     match kind {
         Kind::Each { features } => {
             for &f in features {
-                exec_cargo_with_features(cx, id, &line, progress, keep_going, &[f])?;
+                let mut command = line.clone();
+                command.append_features([f]);
+                commands.push(command);
             }
         }
         Kind::Powerset { features } => {
@@ -607,32 +623,99 @@ fn exec_on_package(
                     //       in some cases this is not the case due to deduplication of the powerset.
                     //       See todo comment in powerset_deduplication test for example.
                     let last = features.last().unwrap();
-                    exec_cargo_with_features(cx, id, &line, progress, keep_going, last)?;
+                    let mut command = line.clone();
+                    command.append_features(last);
+                    commands.push(command);
                     &features[..features.len() - 1]
                 } else {
                     features
                 };
             for f in features {
-                exec_cargo_with_features(cx, id, &line, progress, keep_going, f)?;
+                let mut command = line.clone();
+                command.append_features(f);
+                commands.push(command);
             }
         }
         Kind::Normal => unreachable!(),
     }
 
-    Ok(())
+    commands
 }
 
-fn exec_cargo_with_features(
+fn exec_on_packages_default(
     cx: &Context,
-    id: PackageId,
+    packages: &[PackageRuns<'_>],
     line: &ProcessBuilder<'_>,
     progress: &mut Progress,
     keep_going: &mut KeepGoing,
-    features: &[&Feature],
 ) -> Result<()> {
-    let mut line = line.clone();
-    line.append_features(features);
-    exec_cargo(cx, Some(id), &line, progress, keep_going)
+    if let Some(cache) = &cx.prioritize_cache {
+        // Build the full plan up front so that commands can be reordered
+        // before executing anything (the order must not depend on the results
+        // of the commands executed in this run). The borrow of the cache must
+        // be dropped before executing commands, since recording the output of
+        // a command mutably borrows it.
+        let plan = {
+            let cache = cache.borrow();
+            let mut plan: Vec<_> = packages
+                .iter()
+                .map(|pkg| {
+                    let mut commands: Vec<_> = package_commands(cx, pkg.id, &pkg.kind, line)
+                        .into_iter()
+                        .map(|command| {
+                            (cache.priority(&command_key(cx, Some(pkg.id), &command)), command)
+                        })
+                        .collect();
+                    // Reorder so that commands whose output changed most
+                    // recently run first. The sort is stable, so commands with
+                    // the same priority keep the default order.
+                    commands.sort_by_key(|&(priority, _)| Reverse(priority));
+                    (pkg, commands)
+                })
+                .collect();
+            // Packages are ordered by the highest priority of their commands.
+            plan.sort_by_key(|(_, commands)| Reverse(package_priority(commands)));
+            plan
+        };
+        for (pkg, commands) in plan {
+            for (_, command) in commands {
+                exec_cargo(cx, Some(pkg.id), &command, progress, keep_going)?;
+            }
+        }
+    } else {
+        // Without --prioritize, build and execute the commands of one package
+        // at a time, so that the entire plan is never held in memory.
+        for pkg in packages {
+            for command in package_commands(cx, pkg.id, &pkg.kind, line) {
+                exec_cargo(cx, Some(pkg.id), &command, progress, keep_going)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The maximum priority of the commands run for a package. The commands must
+/// already be sorted by priority in descending order.
+fn package_priority(commands: &[(u64, ProcessBuilder<'_>)]) -> u64 {
+    commands.first().map_or(0, |&(priority, _)| priority)
+}
+
+/// The key under which the command is recorded in the cache used by
+/// `--prioritize`.
+///
+/// The manifest path of the package is included in the key so that commands
+/// that do not contain `--manifest-path` (e.g., with `--no-manifest-path`)
+/// are still recorded separately for each package.
+fn command_key(cx: &Context, id: Option<PackageId>, line: &ProcessBuilder<'_>) -> String {
+    let mut key = format!("{line:#}");
+    if let Some(id) = id {
+        let manifest_path = &cx.packages(id).manifest_path;
+        let manifest_path =
+            manifest_path.strip_prefix(cx.workspace_root()).unwrap_or(manifest_path);
+        key.push('@');
+        key.push_str(&manifest_path.to_string_lossy());
+    }
+    key
 }
 
 #[derive(Default)]
@@ -769,7 +852,20 @@ fn exec_cargo_inner(
 
     let _guard = log_and_update_progress(cx, id, line, progress, "running");
 
-    line.run()
+    if let Some(cache) = &cx.prioritize_cache {
+        let key = command_key(cx, id, line);
+        line.run_tee(move |output| {
+            // Save the cache as soon as an entry changes so that the recorded
+            // output is not lost if the process is killed before the end of
+            // the run (e.g., rust-analyzer cancels checks on the next edit).
+            let mut cache = cache.borrow_mut();
+            if cache.record(&key, output) {
+                cache.save();
+            }
+        })
+    } else {
+        line.run()
+    }
 }
 
 fn cargo_clean(cx: &Context, id: Option<PackageId>) -> Result<()> {

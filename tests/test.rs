@@ -5,8 +5,9 @@
 mod auxiliary;
 
 use std::{
+    collections::HashSet,
     env::{self, consts::EXE_SUFFIX},
-    path::{MAIN_SEPARATOR, Path},
+    path::{MAIN_SEPARATOR, Path, PathBuf},
     sync::Mutex,
 };
 
@@ -53,6 +54,7 @@ fn failure() {
         "--manifest-path=foo",
         "--color=auto",
         "--workspace-behavior=cargo",
+        "--prioritize",
     ] {
         cargo_hack(["check", flag, flag]).assert_failure("real").stderr_contains(format!(
             "The argument '{}' was provided more than once, but cannot be used multiple times",
@@ -1936,6 +1938,248 @@ fn print_command_list() {
             ",
         )
         .stdout_not_contains("`");
+}
+
+#[test]
+fn prioritize() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    test_helper::git::copy_tracked_files(fixtures_dir().join("real"), tmpdir.path());
+    let run = |args: &[&str]| {
+        let output =
+            cargo_bin_exe().args(["hack"]).args(args).current_dir(tmpdir.path()).output().unwrap();
+        assert!(
+            output.status.success(),
+            "STDOUT:\n{}\nSTDERR:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+
+    // First run: records the output of each command.
+    let output = run(&["check", "--workspace", "--each-feature", "--prioritize"]);
+    // The output of the cargo commands is forwarded to the output of
+    // cargo-hack while it is being recorded.
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Finished"),
+        "STDERR:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Introduce a warning that is only enabled by feature `b`.
+    let lib = tmpdir.path().join("src/lib.rs");
+    let mut src = std::fs::read_to_string(&lib).unwrap();
+    src.push_str(
+        "
+        #[cfg(feature = \"b\")]
+        fn b_only() {
+            let unused = 1;
+        }
+        ",
+    );
+    std::fs::write(&lib, src).unwrap();
+
+    // Second run: records that the output of the commands enabling feature `b`
+    // of the `real` package changed.
+    run(&["check", "--workspace", "--each-feature", "--prioritize"]);
+
+    // Third run: does not run commands, so the cache is only read.
+    let output =
+        run(&["check", "--workspace", "--each-feature", "--prioritize", "--print-command-list"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<_> = stdout.lines().collect();
+
+    // The commands of the package affected by the edit run first, and within
+    // it the commands whose output changed run before the others (in the
+    // default order). The commands of the other packages follow in the
+    // default order.
+    let expected = [
+        "cargo check --manifest-path Cargo.toml --all-features",
+        "cargo check --manifest-path Cargo.toml --no-default-features --features b",
+        "cargo check --manifest-path Cargo.toml --no-default-features",
+        "cargo check --manifest-path Cargo.toml --no-default-features --features a",
+        "cargo check --manifest-path Cargo.toml --no-default-features --features c",
+        "cargo check --manifest-path Cargo.toml --no-default-features --features default",
+    ];
+    assert!(lines.len() > expected.len(), "{lines:#?}");
+    assert_eq!(lines[..expected.len()], expected, "{lines:#?}");
+    assert!(lines[expected.len()..].iter().all(|l| l.contains("member")), "{lines:#?}");
+}
+
+#[test]
+fn prioritize_json() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    test_helper::git::copy_tracked_files(fixtures_dir().join("real"), tmpdir.path());
+    let run = |args: &[&str]| {
+        let output =
+            cargo_bin_exe().args(["hack"]).args(args).current_dir(tmpdir.path()).output().unwrap();
+        assert!(
+            output.status.success(),
+            "STDOUT:\n{}\nSTDERR:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+    let json_check: &[&str] =
+        &["check", "--workspace", "--each-feature", "--prioritize", "--message-format=json"];
+
+    // First run: records the output of each command. In addition to the
+    // diagnostics, the output contains cargo JSON messages that change between
+    // runs (e.g., artifact messages whose fresh flag differs); they must not
+    // affect the recorded fingerprints.
+    let output = run(json_check);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("compiler-artifact"), "{stdout}");
+
+    // Second run: no command has actually changed, so nothing is recorded as
+    // changed even though every artifact message differs from the first run
+    // (everything was compiled in the first run and is fresh in this run).
+    run(json_check);
+
+    // Introduce a warning that is only enabled by feature `b`.
+    let lib = tmpdir.path().join("src/lib.rs");
+    let mut src = std::fs::read_to_string(&lib).unwrap();
+    src.push_str(
+        "
+        #[cfg(feature = \"b\")]
+        fn b_only() {
+            let unused = 1;
+        }
+        ",
+    );
+    std::fs::write(&lib, src).unwrap();
+
+    // Third run: records that the output of the commands enabling feature `b`
+    // of the `real` package changed.
+    run(json_check);
+
+    // Fourth run: does not run commands, so the cache is only read.
+    let output = run(&[
+        "check",
+        "--workspace",
+        "--each-feature",
+        "--prioritize",
+        "--message-format=json",
+        "--print-command-list",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<_> = stdout.lines().collect();
+
+    // As in the human-readable output case, only the commands whose
+    // diagnostics changed run first; the volatile artifact messages must not
+    // affect the order.
+    let expected = [
+        "cargo check --message-format=json --manifest-path Cargo.toml --all-features",
+        "cargo check --message-format=json --manifest-path Cargo.toml --no-default-features --features b",
+        "cargo check --message-format=json --manifest-path Cargo.toml --no-default-features",
+        "cargo check --message-format=json --manifest-path Cargo.toml --no-default-features --features a",
+        "cargo check --message-format=json --manifest-path Cargo.toml --no-default-features --features c",
+        "cargo check --message-format=json --manifest-path Cargo.toml --no-default-features --features default",
+    ];
+    assert!(lines.len() > expected.len(), "{lines:#?}");
+    assert_eq!(lines[..expected.len()], expected, "{lines:#?}");
+    assert!(lines[expected.len()..].iter().all(|l| l.contains("member")), "{lines:#?}");
+}
+
+#[test]
+fn prioritize_partition_conflict() {
+    cargo_hack(["check", "--prioritize", "--partition", "1/2"])
+        .assert_failure("real")
+        .stderr_contains("--prioritize may not be used together with --partition");
+}
+
+/// Returns the paths of the `--prioritize` cache files in the target
+/// directory of the workspace in `dir`.
+fn prioritize_cache_files(dir: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir.join("target/cargo-hack"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.file_name().unwrap().to_string_lossy().starts_with("prioritize-"))
+        .collect()
+}
+
+#[test]
+fn prioritize_no_manifest_path() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    test_helper::git::copy_tracked_files(fixtures_dir().join("real"), tmpdir.path());
+    let run = |args: &[&str]| {
+        let output =
+            cargo_bin_exe().args(["hack"]).args(args).current_dir(tmpdir.path()).output().unwrap();
+        assert!(
+            output.status.success(),
+            "STDOUT:\n{}\nSTDERR:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+
+    // First run: records the output of each command. Without --manifest-path,
+    // the command lines executed for the four packages are identical, so the
+    // package must be part of the cache key.
+    run(&["check", "--workspace", "--each-feature", "--prioritize", "--no-manifest-path"]);
+
+    // Does not run commands; used to count the commands executed per run.
+    let output = run(&[
+        "check",
+        "--workspace",
+        "--each-feature",
+        "--prioritize",
+        "--no-manifest-path",
+        "--print-command-list",
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<_> = stdout.lines().collect();
+    // The same command line is executed once per package.
+    let distinct: HashSet<_> = lines.iter().collect();
+    assert!(distinct.len() < lines.len(), "{lines:#?}");
+
+    let cache = prioritize_cache_files(tmpdir.path());
+    assert_eq!(cache.len(), 1, "{cache:#?}");
+    let doc: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&cache[0]).unwrap()).unwrap();
+    let entries = doc["entries"].as_object().unwrap();
+    // One entry per executed command, not one per distinct command line.
+    assert_eq!(entries.len(), lines.len(), "{:#?}", entries.keys().collect::<Vec<_>>());
+    // Entries for all four packages.
+    let packages: HashSet<_> = entries.keys().map(|key| key.split_once('@').unwrap().1).collect();
+    assert_eq!(packages.len(), 4, "{packages:#?}");
+}
+
+#[test]
+fn prioritize_print_command_list() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    test_helper::git::copy_tracked_files(fixtures_dir().join("real"), tmpdir.path());
+    let run = |args: &[&str]| {
+        let output =
+            cargo_bin_exe().args(["hack"]).args(args).current_dir(tmpdir.path()).output().unwrap();
+        assert!(
+            output.status.success(),
+            "STDOUT:\n{}\nSTDERR:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+
+    // --print-command-list does not run commands, so it must not create a
+    // cache file.
+    run(&["check", "--workspace", "--each-feature", "--prioritize", "--print-command-list"]);
+    assert!(prioritize_cache_files(tmpdir.path()).is_empty());
+
+    // First run: records the output of each command.
+    run(&["check", "--workspace", "--each-feature", "--prioritize"]);
+    let cache = prioritize_cache_files(tmpdir.path());
+    assert_eq!(cache.len(), 1, "{cache:#?}");
+    let before = std::fs::read(&cache[0]).unwrap();
+
+    // A run that does not execute commands must not update the cache file.
+    run(&["check", "--workspace", "--each-feature", "--prioritize", "--print-command-list"]);
+    let after = std::fs::read(&cache[0]).unwrap();
+    assert!(before == after, "the cache file was updated by --print-command-list");
 }
 
 #[test]

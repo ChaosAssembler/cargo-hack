@@ -49,6 +49,8 @@ OPTIONS:
         --keep-going                     Keep going on failure
         --partition <M/N>                Partition runs and execute only its subset according to
                                          M/N
+        --prioritize                     Prioritize commands whose diagnostics changed in previous
+                                         runs
         --log-group <KIND>               Log grouping: none, github-actions
         --workspace-behavior=cargo       Use Cargo's workspace handling
         --print-command-list             Print commands without run (Unstable)

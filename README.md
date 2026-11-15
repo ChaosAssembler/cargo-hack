@@ -225,6 +225,29 @@ OPTIONS:
         --partition <M/N>
             Partition runs and execute only its subset according to M/N.
 
+        --prioritize
+            Prioritize commands whose diagnostics changed in previous runs.
+
+            When this flag is used, the diagnostics of each cargo command are recorded in a cache
+            file in the target directory, and in subsequent runs commands are executed in order of
+            how recently their diagnostics changed (the most recently changed first).
+
+            This does not skip any commands; it only changes the order in which they are executed.
+
+            This option is intended for commands whose diagnostics matter (e.g., check and clippy);
+            while the output is recorded, cargo's colors and progress indicators are disabled.
+
+            The cache file is stored in the target directory reported by cargo metadata (it does
+            not follow --target-dir passed to cargo) and is removed by cargo clean.
+
+            If runs are repeatedly cancelled before completion (e.g., by rust-analyzer on the next
+            edit), commands whose diagnostics changed may not be discovered until a run completes;
+            commands that have never been run are executed first.
+
+            This option has no effect with --workspace-behavior=cargo.
+
+            This flag may not be used together with --partition.
+
         --log-group <KIND>
             Log grouping: none, github-actions.
 
